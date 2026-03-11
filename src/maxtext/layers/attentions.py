@@ -72,6 +72,25 @@ from maxtext.inference import kvcache, page_manager, paged_attention
 from maxtext.inference.kvcache import KVQuant
 from maxtext.utils.sharding import maybe_shard_with_logical, create_sharding
 
+try:
+  from pattern.maxtext_nsa_qwen import (
+      apply_maxtext_nsa_attention,
+      build_maxtext_nsa_gate_module,
+      build_maxtext_nsa_phi_module,
+      get_maxtext_nsa_config,
+      is_maxtext_nsa_layer,
+  )
+except ImportError:  # Thesis NSA integration is optional.
+  apply_maxtext_nsa_attention = None
+  build_maxtext_nsa_gate_module = None
+  build_maxtext_nsa_phi_module = None
+
+  def get_maxtext_nsa_config():
+    return None
+
+  def is_maxtext_nsa_layer(config, layer_idx):
+    return False
+
 # pylint: disable=line-too-long, g-doc-args, g-doc-return-or-yield, bad-continuation, g-inconsistent-quotes
 # pytype: disable=attribute-error
 
@@ -334,6 +353,7 @@ class Attention(nnx.Module):
       mrope_section: tuple[int, int, int] | None = None,
       name: str | None = None,
       rope_type: str | None = None,
+      nsa_layer_idx: int | None = None,
       rngs: Optional[nnx.Rngs] = None,
   ):
     """Initializes the Attention module.
@@ -433,6 +453,19 @@ class Attention(nnx.Module):
     self.use_mrope = use_mrope
     self.mrope_section = mrope_section
     self.rngs = rngs
+    self.nsa_config = get_maxtext_nsa_config()
+    self.nsa_layer_idx = nsa_layer_idx
+    if (
+        nsa_layer_idx is not None
+        and build_maxtext_nsa_phi_module is not None
+        and is_maxtext_nsa_layer(self.nsa_config, nsa_layer_idx)
+    ):
+      self.nsa_phi_mid_0 = build_maxtext_nsa_phi_module(self.head_dim, self.nsa_config)
+      setattr(
+          self,
+          f"nsa_layer_{nsa_layer_idx}",
+          build_maxtext_nsa_gate_module(self.head_dim, self.nsa_config, nsa_layer_idx),
+      )
     # Use the rope type specified in the arguments if provided, otherwise fall back to the one in the config.
     self.rope_type = (rope_type or self.config.rope_type).lower()
 
@@ -1128,7 +1161,28 @@ class Attention(nnx.Module):
 
     assert not self.config.quantize_kvcache or self.kv_quant
 
-    if self.config.attention == "paged" and model_mode != MODEL_MODE_TRAIN:
+    nsa_config = getattr(self, "nsa_config", None)
+    nsa_layer_idx = getattr(self, "nsa_layer_idx", None)
+    nsa_gate_module = getattr(self, f"nsa_layer_{nsa_layer_idx}", None) if nsa_layer_idx is not None else None
+    if (
+        model_mode == MODEL_MODE_TRAIN
+        and apply_maxtext_nsa_attention is not None
+        and nsa_layer_idx is not None
+        and is_maxtext_nsa_layer(nsa_config, nsa_layer_idx)
+        and hasattr(self, "nsa_phi_mid_0")
+        and nsa_gate_module is not None
+    ):
+      out = apply_maxtext_nsa_attention(
+          query,
+          key,
+          value,
+          nsa_config=nsa_config,
+          phi_params=self.nsa_phi_mid_0.as_tree(),
+          gate_params=nsa_gate_module.as_tree(),
+      )
+      kv_cache = None
+
+    elif self.config.attention == "paged" and model_mode != MODEL_MODE_TRAIN:
       unnormalized_out, _, exp_sum = self.paged_attention_op(
           query, key, value, decoder_segment_ids, model_mode, previous_chunk, slot=slot, page_state=page_state
       )

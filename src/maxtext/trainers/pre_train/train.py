@@ -58,6 +58,7 @@ from maxtext.common.goodput import (
 from maxtext.common.gcloud_stub import cloud_diagnostics as _cloud_diag, is_decoupled
 from maxtext.common.gcloud_stub import vertex_tensorboard_modules
 from maxtext.common.metric_logger import MetricLogger, record_activation_metrics
+from maxtext.optimizers import optimizers
 from maxtext.trainers.post_train.dpo.dpo_utils import _merge_dpo_state, _split_dpo_state, dpo_loss_fn
 from maxtext.utils import exceptions
 from maxtext.utils import gcs_utils
@@ -106,6 +107,8 @@ def loss_fn(model, config, data, dropout_rng, params, is_train=True):
   else:
     for k, v in data.items():
       data[k] = v[: config.micro_batch_size_to_eval_on, :]
+  params = optimizers.stop_gradient_frozen_params(params) if is_train else params
+
   mutable_collections = ["intermediates"]
   if config.mtp_num_layers > 0 and is_train:
     # The single model.apply call now triggers the entire chain if MTP is enabled:

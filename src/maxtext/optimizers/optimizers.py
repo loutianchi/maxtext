@@ -15,6 +15,7 @@
 # pylint: disable=bare-except, consider-using-generator, too-many-positional-arguments
 """ Utils that are only interesting to MaxText. """
 
+import os
 import re
 import jax
 import jax.numpy as jnp
@@ -22,6 +23,40 @@ import jax.numpy as jnp
 import optax
 from optax.contrib._muon import muon
 from maxtext.utils.muon_utils import get_muon_weight_dimension_numbers
+
+
+def _path_to_str(path):
+  return "/".join(str(getattr(p, "key", getattr(p, "idx", getattr(p, "name", p)))) for p in path)
+
+
+def _get_trainable_patterns_from_env():
+  value = os.environ.get("THESIS_MAXTEXT_TRAINABLE_PATTERNS", "").strip()
+  if not value:
+    return []
+  return [re.compile(part.strip()) for part in value.split(",") if part.strip()]
+
+
+def get_trainable_label_tree(params):
+  patterns = _get_trainable_patterns_from_env()
+  if not patterns:
+    return None
+
+  def _label(path, _):
+    path_str = _path_to_str(path)
+    return "trainable" if any(pattern.search(path_str) for pattern in patterns) else "frozen"
+
+  return jax.tree_util.tree_map_with_path(_label, params)
+
+
+def stop_gradient_frozen_params(params):
+  label_tree = get_trainable_label_tree(params)
+  if label_tree is None:
+    return params
+  return jax.tree_util.tree_map(
+      lambda value, label: value if label == "trainable" else jax.lax.stop_gradient(value),
+      params,
+      label_tree,
+  )
 
 
 def get_adamw_mask(config):
@@ -46,9 +81,21 @@ def get_adamw_mask(config):
 
 def get_optimizer(config, learning_rate_schedule, model=None):
   """Create optimizer."""
+
+  def _maybe_restrict_optimizer(base_optimizer):
+    if not _get_trainable_patterns_from_env():
+      return base_optimizer
+    return optax.multi_transform(
+        {
+            "trainable": base_optimizer,
+            "frozen": optax.set_to_zero(),
+        },
+        get_trainable_label_tree,
+    )
+
   if config.opt_type == "adamw":
     # Create AdamW Optimizer following Llama2's training details, see https://arxiv.org/pdf/2307.09288.pdf section 2.2
-    return optax.adamw(
+    return _maybe_restrict_optimizer(optax.adamw(
         learning_rate_schedule,
         b1=config.adam_b1,
         b2=config.adam_b2,
@@ -57,9 +104,9 @@ def get_optimizer(config, learning_rate_schedule, model=None):
         weight_decay=config.adam_weight_decay,
         mu_dtype=config.mu_dtype,
         mask=get_adamw_mask(config),
-    )
+    ))
   elif config.opt_type == "adam_pax":
-    return adam_pax(
+    return _maybe_restrict_optimizer(adam_pax(
         learning_rate_schedule,
         beta1=config.adam_b1,
         beta2=config.adam_b2,
@@ -67,9 +114,9 @@ def get_optimizer(config, learning_rate_schedule, model=None):
         epsilon_root=config.adam_eps_root,
         weight_decay=config.adam_weight_decay,
         mask=get_adamw_mask(config),
-    )
+    ))
   elif config.opt_type == "sgd":
-    return optax.sgd(learning_rate_schedule)
+    return _maybe_restrict_optimizer(optax.sgd(learning_rate_schedule))
   elif config.opt_type == "muon":
     # extract muon dimension number from model structure
     if model is not None:
@@ -92,7 +139,7 @@ def get_optimizer(config, learning_rate_schedule, model=None):
         "adam_eps_root": config.adam_eps_root,
         "adam_weight_decay": config.adam_weight_decay,
     }
-    return muon(**muon_kwargs)
+    return _maybe_restrict_optimizer(muon(**muon_kwargs))
   else:
     raise ValueError(f"{config.opt_type=} is not a supported.")
 

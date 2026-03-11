@@ -1018,8 +1018,8 @@ class Decoder(nn.Module):
                   "is_nope_layer": llama4.determine_is_nope_layer(lyr, self.config.nope_layer_interval),
                   "is_moe_layer": llama4.determine_is_moe_layer(lyr, self.config.interleave_moe_layer_step),
               }
-            if cfg.decoder_block == DecoderBlockType.QWEN3_NEXT:
-              layer_kwargs = {"layer_idx": lyr}
+            if cfg.decoder_block in [DecoderBlockType.QWEN3, DecoderBlockType.QWEN3_MOE, DecoderBlockType.QWEN3_NEXT]:
+              layer_kwargs["layer_idx"] = lyr
             kv_cache = None
             if kv_caches is not None and cfg.decoder_block != DecoderBlockType.QWEN3_NEXT:
               kv_cache = kv_caches[lyr]

@@ -1078,7 +1078,8 @@ class AttentionWithNorm(nnx.Module):
       mesh: Mesh,
       model_mode: str,
       quant: None | Quant,
-      rngs: nnx.Rngs,
+      layer_idx: int | None = None,
+      rngs: nnx.Rngs = None,
   ):
     self.config = config
     self.mesh = mesh
@@ -1123,6 +1124,7 @@ class AttentionWithNorm(nnx.Module):
         use_qk_norm=config.use_qk_norm,
         query_pre_attn_scalar=query_pre_attn_scalar,
         model_mode=model_mode,
+        nsa_layer_idx=layer_idx,
         use_mrope=config.use_mrope,
         mrope_section=config.mrope_section,
         rngs=rngs,
@@ -1186,9 +1188,10 @@ class Qwen3DecoderLayer(AttentionWithNorm):
       mesh: Mesh,
       model_mode: str,
       quant: None | Quant,
-      rngs: nnx.Rngs,
+      layer_idx: int | None = None,
+      rngs: nnx.Rngs = None,
   ):
-    super().__init__(config, mesh, model_mode, quant, rngs)
+    super().__init__(config, mesh, model_mode, quant, layer_idx=layer_idx, rngs=rngs)
     self.mlp = MlpBlock(
         in_features=config.emb_dim,
         intermediate_dim=config.mlp_dim,
@@ -1253,9 +1256,10 @@ class Qwen3MoeDecoderLayer(AttentionWithNorm):
       mesh: Mesh,
       model_mode: str,
       quant: None | Quant,
-      rngs: nnx.Rngs,
+      layer_idx: int | None = None,
+      rngs: nnx.Rngs = None,
   ):
-    super().__init__(config, mesh, model_mode, quant, rngs)
+    super().__init__(config, mesh, model_mode, quant, layer_idx=layer_idx, rngs=rngs)
     self.moe_block = RoutedMoE(
         config=config,
         num_experts=config.num_experts,
