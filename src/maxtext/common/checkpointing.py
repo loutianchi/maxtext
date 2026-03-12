@@ -122,14 +122,16 @@ def is_trainable_only_checkpoint_payload(payload) -> bool:
 def merge_trainable_checkpoint_params(full_params, trainable_params):
   full_flat = _flatten_mapping(full_params)
   full_flat.update(_flatten_mapping(trainable_params))
-  return frozen_dict.freeze(traverse_util.unflatten_dict(full_flat))
+  merged = traverse_util.unflatten_dict(full_flat)
+  return frozen_dict.freeze(merged) if isinstance(full_params, frozen_dict.FrozenDict) else merged
 
 
 def checkpoint_is_trainable_only_payload(checkpoint_manager, step: int) -> bool:
   metadata_path = checkpoint_manager.directory / str(step) / "items" / "_METADATA"
   if not metadata_path.exists():
     return False
-  metadata_text = metadata_path.read_text(errors="ignore")
+  with metadata_path.open("r") as f:
+    metadata_text = f.read()
   return "('trainable_params'," in metadata_text
 
 
