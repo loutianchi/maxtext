@@ -14,12 +14,16 @@
 
 """Create an Orbax CheckpointManager with specified (Async or not) Checkpointer."""
 
+import os
+import re
 import time
 from typing import Any, Optional
 
 from absl import flags
 import datetime
 from etils import epath
+from flax import traverse_util
+from flax.core import frozen_dict
 from flax.training import train_state
 import jax
 from maxtext.utils.globals import DEFAULT_OCDBT_TARGET_DATA_FILE_SIZE
@@ -51,6 +55,82 @@ EmergencyCheckpointManager = emergency_checkpoint_manager.CheckpointManager
 LocalCheckpointOptions = emergency_checkpoint_manager.LocalCheckpointOptions
 PersistentCheckpointOptions = emergency_checkpoint_manager.PersistentCheckpointOptions
 EmergencyReplicatorCheckpointManager = emergency_replicator_checkpoint_manager.ReplicatorCheckpointManager
+
+
+def _trainable_only_checkpointing_enabled() -> bool:
+  value = os.environ.get("THESIS_MAXTEXT_CHECKPOINT_TRAINABLE_ONLY", "1").strip().lower()
+  return bool(os.environ.get("THESIS_MAXTEXT_TRAINABLE_PATTERNS", "").strip()) and value not in ("0", "false", "no")
+
+
+def _path_to_str(path):
+  return "/".join(str(getattr(p, "key", getattr(p, "idx", getattr(p, "name", p)))) for p in path)
+
+
+def _get_trainable_patterns_from_env():
+  value = os.environ.get("THESIS_MAXTEXT_TRAINABLE_PATTERNS", "").strip()
+  if not value:
+    return []
+  return [re.compile(part.strip()) for part in value.split(",") if part.strip()]
+
+
+def _get_trainable_label_tree(params):
+  patterns = _get_trainable_patterns_from_env()
+  if not patterns:
+    return None
+
+  def _label(path, _):
+    path_str = _path_to_str(path)
+    return "trainable" if any(pattern.search(path_str) for pattern in patterns) else "frozen"
+
+  return jax.tree_util.tree_map_with_path(_label, params)
+
+
+def _flatten_mapping(tree):
+  return traverse_util.flatten_dict(frozen_dict.unfreeze(tree), keep_empty_nodes=False)
+
+
+def _sparse_trainable_tree(tree):
+  label_tree = _get_trainable_label_tree(tree)
+  if label_tree is None:
+    return tree
+  flat_tree = _flatten_mapping(tree)
+  flat_labels = _flatten_mapping(label_tree)
+  filtered = {path: value for path, value in flat_tree.items() if flat_labels.get(path) == "trainable"}
+  return frozen_dict.freeze(traverse_util.unflatten_dict(filtered))
+
+
+def build_trainable_only_checkpoint_state(state):
+  return {
+      "step": state.step,
+      "trainable_params": _sparse_trainable_tree(state.params),
+      "opt_state": state.opt_state,
+  }
+
+
+def build_trainable_only_abstract_state(abstract_state):
+  return {
+      "step": abstract_state.step,
+      "trainable_params": _sparse_trainable_tree(abstract_state.params),
+      "opt_state": abstract_state.opt_state,
+  }
+
+
+def is_trainable_only_checkpoint_payload(payload) -> bool:
+  return isinstance(payload, dict) and {"step", "trainable_params", "opt_state"}.issubset(payload.keys())
+
+
+def merge_trainable_checkpoint_params(full_params, trainable_params):
+  full_flat = _flatten_mapping(full_params)
+  full_flat.update(_flatten_mapping(trainable_params))
+  return frozen_dict.freeze(traverse_util.unflatten_dict(full_flat))
+
+
+def checkpoint_is_trainable_only_payload(checkpoint_manager, step: int) -> bool:
+  metadata_path = checkpoint_manager.directory / str(step) / "items" / "_METADATA"
+  if not metadata_path.exists():
+    return False
+  metadata_text = metadata_path.read_text(errors="ignore")
+  return "('trainable_params'," in metadata_text
 
 
 class GrainCheckpointHandler(PyGrainCheckpointHandler, ocp.CheckpointHandler):
@@ -590,8 +670,13 @@ def load_state_if_possible(
         )
         ocp.type_handlers.register_type_handler(jax.Array, array_handler, override=True)
 
-      restore_args = jax.tree_util.tree_map(map_to_pspec, abstract_unboxed_pre_state)
-      checkpoint_args = ocp.args.PyTreeRestore(item=abstract_unboxed_pre_state, restore_args=restore_args)
+      checkpoint_item = (
+          build_trainable_only_abstract_state(abstract_unboxed_pre_state)
+          if _trainable_only_checkpointing_enabled() and checkpoint_is_trainable_only_payload(checkpoint_manager, step)
+          else abstract_unboxed_pre_state
+      )
+      restore_args = jax.tree_util.tree_map(map_to_pspec, checkpoint_item)
+      checkpoint_args = ocp.args.PyTreeRestore(item=checkpoint_item, restore_args=restore_args)
 
       match (checkpoint_manager, dataset_type, data_iterator):
         # Case 1: Matches if 'checkpoint_manager' is an instance of either EmergencyCheckpointManager
@@ -769,9 +854,10 @@ def save_checkpoint(checkpoint_manager, step, state, config=None, data_iterator=
       config.checkpoint_storage_target_data_file_size_bytes if config else DEFAULT_OCDBT_TARGET_DATA_FILE_SIZE
   )
 
+  state_to_save = build_trainable_only_checkpoint_state(state) if _trainable_only_checkpointing_enabled() else state
   checkpoint_args = ocp.args.PyTreeSave(
-      item=state,
-      save_args=jax.tree.map(lambda _: ocp.SaveArgs(chunk_byte_size=chunk_byte_size), state),
+      item=state_to_save,
+      save_args=jax.tree.map(lambda _: ocp.SaveArgs(chunk_byte_size=chunk_byte_size), state_to_save),
       ocdbt_target_data_file_size=chunk_byte_size,
   )
   save_args_composite = {"items": checkpoint_args}

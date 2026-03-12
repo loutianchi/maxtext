@@ -1159,10 +1159,27 @@ def setup_initial_state(
               emergency_replicator_checkpoint_manager.ReplicatorCheckpointManager,
           ),
       ):
-        state = restored
+        restored_state = restored
       else:
         # The update of data_iterator state happens in place, no need to assign explicitly
-        state = restored["items"]
+        restored_state = restored["items"]
+
+      if checkpointing.is_trainable_only_checkpoint_payload(restored_state):
+        init_state_partial = functools.partial(init_initial_state, model, tx, config, is_training)
+        init_state_partial.__name__ = "initialize_state"
+        # pylint: disable=not-callable
+        state = jax.jit(
+            init_state_partial,
+            in_shardings=None,
+            out_shardings=state_mesh_shardings,
+        )(rng)
+        state = state.replace(
+            step=restored_state["step"],
+            params=checkpointing.merge_trainable_checkpoint_params(state.params, restored_state["trainable_params"]),
+            opt_state=restored_state["opt_state"],
+        )
+      else:
+        state = restored_state
     else:
       init_state_partial = functools.partial(init_initial_state, model, tx, config, is_training)
       init_state_partial.__name__ = "initialize_state"
